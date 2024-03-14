@@ -1,5 +1,8 @@
 # all files with SCRATCH prefix and large model / metric files
 **/SCRATCH*
+**/ray_results/**
+**/log/**
+**/model/**
 /pretrained_checkpoints
 /trained_models
 eval/e2e
@@ -9,7 +12,9 @@ trained_models
 pretrained_checkpoints
 .*
 *~*
-
+*.pt
+logs.txt
+**/wandb/**
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

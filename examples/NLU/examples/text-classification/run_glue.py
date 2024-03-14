@@ -23,7 +23,12 @@ import sys
 import torch
 from dataclasses import dataclass, field
 from typing import Optional
-
+import ray
+from ray import tune
+from ray.tune import CLIReporter
+from ray.tune.schedulers import ASHAScheduler
+import json
+# from utils import MyAwesomeTrainer
 import numpy as np
 from datasets import load_dataset, load_metric
 
@@ -58,6 +63,18 @@ task_to_keys = {
     "sst2": ("sentence", None),
     "stsb": ("sentence1", "sentence2"),
     "wnli": ("sentence1", "sentence2"),
+}
+
+task_to_metric = {
+    "cola": "eval_matthews_correlation",
+    "mnli": "eval_accuracy",
+    "mrpc": "eval_accuracy",
+    "qnli": "eval_accuracy",
+    "qqp": "eval_accuracy",
+    "rte": "eval_accuracy",
+    "sst2": "eval_accuracy",
+    "stsb": "eval_pearson",
+    "wnli": "eval_accuracy",
 }
 
 logger = logging.getLogger(__name__)
@@ -148,6 +165,10 @@ class ModelArguments:
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
+    do_tune: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to do HPO with Ray Tune or not."}
+    )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
@@ -232,9 +253,13 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    torch.use_deterministic_algorithms(training_args.use_deterministic_algorithms)
-    logger.info("use_deterministic_algorithms: " + str(torch.are_deterministic_algorithms_enabled()))
-
+    torch.use_deterministic_algorithms(True)
+    
+    run_name = os.path.split(training_args.output_dir)[-1]
+    import time
+    os.environ["WANDB_PROJECT"] = "lora"
+    os.environ["WANDB_RUN_GROUP"] = run_name + "_" + time.strftime("%Y%m%d-%H%M%S")
+    os.environ["WANDB_API_KEY"] = "16d21dc747a6f33247f1e9c96895d4ffa5ea0b27"
     # Detecting last checkpoint.
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -342,6 +367,9 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    if model_args.lora_alpha == None:
+        model_args.lora_alpha = model_args.lora_r * 2
+        
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
@@ -349,7 +377,7 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-        cls_dropout=training_args.cls_dropout,
+        cls_dropout=training_args.cls_dropout if hasattr(training_args, 'cls_dropout') else 0.,
         apply_lora=model_args.apply_lora,
         lora_alpha=model_args.lora_alpha,
         lora_r=model_args.lora_r,
@@ -366,57 +394,68 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
+    
+    def model_init(hyperparams: dict = {}):
+        set_seed(training_args.seed)
+        # Ensure override 
+        if hyperparams is not None:
+            for key, value in hyperparams.items():
+                if key in config.__dict__:
+                    setattr(config, key, value)
+                
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
 
-    trainable_params = []
-    if model_args.apply_lora:
-        if model_args.lora_path is not None:
-            lora_state_dict = torch.load(model_args.lora_path)
-            logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
-            logger.info(lora_state_dict.keys())
-            model.load_state_dict(lora_state_dict, strict=False)
-        trainable_params.append('lora')
+        trainable_params = []
+        if model_args.apply_lora:
+            if model_args.lora_path is not None:
+                lora_state_dict = torch.load(model_args.lora_path)
+                logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
+                logger.info(lora_state_dict.keys())
+                model.load_state_dict(lora_state_dict, strict=False)
+            trainable_params.append('lora')
 
-    if model_args.apply_adapter:
-        if model_args.adapter_path is not None:
-            adapter_state_dict = torch.load(os.path.join(model_args.adapter_path, 'pytorch_adapter.bin'))
-            head_state_dict = torch.load(os.path.join(model_args.adapter_path, 'pytorch_model_head.bin'))
-            added_state_dict = {}
-            for k, v in adapter_state_dict.items():
-                new_k = k.replace(data_args.task_name + '.', '').replace('adapter_down.0.', 'adapter_A.').replace('adapter_up.', 'adapter_B.').replace('.adapters.', '.adapter.')
-                added_state_dict[new_k] = v
-            for k, v in head_state_dict.items():
-                new_k = k.replace('heads.' + data_args.task_name + '.1', 'classifier.dense').replace('heads.' + data_args.task_name + '.4', 'classifier.out_proj')
-                added_state_dict[new_k] = v
-            logger.info(f"Apply adapter state dict from {model_args.adapter_path}.")
-            logger.info(added_state_dict.keys())
-            missing_keys, unexpected_keys = model.load_state_dict(added_state_dict, strict=False)
-            for missing_key in missing_keys:
-                assert 'adapter' not in missing_key, missing_key + ' is missed in the model'
-            assert len(unexpected_keys) == 0, 'Unexpected keys ' + str(unexpected_keys)
-        trainable_params.append('adapter')
+        if model_args.apply_adapter:
+            if model_args.adapter_path is not None:
+                adapter_state_dict = torch.load(os.path.join(model_args.adapter_path, 'pytorch_adapter.bin'))
+                head_state_dict = torch.load(os.path.join(model_args.adapter_path, 'pytorch_model_head.bin'))
+                added_state_dict = {}
+                for k, v in adapter_state_dict.items():
+                    new_k = k.replace(data_args.task_name + '.', '').replace('adapter_down.0.', 'adapter_A.').replace('adapter_up.', 'adapter_B.').replace('.adapters.', '.adapter.')
+                    added_state_dict[new_k] = v
+                for k, v in head_state_dict.items():
+                    new_k = k.replace('heads.' + data_args.task_name + '.1', 'classifier.dense').replace('heads.' + data_args.task_name + '.4', 'classifier.out_proj')
+                    added_state_dict[new_k] = v
+                logger.info(f"Apply adapter state dict from {model_args.adapter_path}.")
+                logger.info(added_state_dict.keys())
+                missing_keys, unexpected_keys = model.load_state_dict(added_state_dict, strict=False)
+                for missing_key in missing_keys:
+                    assert 'adapter' not in missing_key, missing_key + ' is missed in the model'
+                assert len(unexpected_keys) == 0, 'Unexpected keys ' + str(unexpected_keys)
+            trainable_params.append('adapter')
 
-    if model_args.apply_bitfit:
-        trainable_params.append('bias')
+        if model_args.apply_bitfit:
+            trainable_params.append('bias')
 
-    if len(trainable_params) > 0:
-        for name, param in model.named_parameters():
-            if name.startswith('deberta') or name.startswith('roberta'):
-                param.requires_grad = False
-                for trainable_param in trainable_params:
-                    if trainable_param in name:
-                        param.requires_grad = True
-                        break
-            else:
-                param.requires_grad = True
-
+        if len(trainable_params) > 0:
+            for name, param in model.named_parameters():
+                if name.startswith('deberta') or name.startswith('roberta'):
+                    param.requires_grad = False
+                    for trainable_param in trainable_params:
+                        if trainable_param in name:
+                            param.requires_grad = True
+                            break
+                else:
+                    param.requires_grad = True
+        return model
+    
+    
     # Preprocessing the datasets
     if data_args.task_name is not None:
         sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
@@ -439,6 +478,7 @@ def main():
         padding = False
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
+    model = model_init()
     label_to_id = None
     if (
         model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
@@ -464,7 +504,9 @@ def main():
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-
+    del model 
+    
+    
     def preprocess_function(examples):
         # Tokenize the texts
         args = (
@@ -478,19 +520,17 @@ def main():
         return result
 
     datasets = datasets.map(preprocess_function, batched=True, load_from_cache_file=not data_args.overwrite_cache)
-    if training_args.do_train:
-        if "train" not in datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = datasets["train"]
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+    if "train" not in datasets:
+        raise ValueError("--do_train requires a train dataset")
+    train_dataset = datasets["train"]
+    if data_args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
-    if training_args.do_eval:
-        if "validation" not in datasets and "validation_matched" not in datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
-        if data_args.max_val_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
+    if "validation" not in datasets and "validation_matched" not in datasets:
+        raise ValueError("--do_eval requires a validation dataset")
+    eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
+    if data_args.max_val_samples is not None:
+        eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
 
     if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
         if "test" not in datasets and "test_matched" not in datasets:
@@ -534,18 +574,83 @@ def main():
         data_collator = None
 
     # Initialize our Trainer
+    training_args.load_best_model_at_end = True
+    training_args.save_total_limit = 1
     trainer = Trainer(
-        model=model,
+        model_init=model_init,
         args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
-
+ 
+    # HPO with Ray Tune
+    if model_args.do_tune:
+        
+        param_space = {
+            # "nblocks": tune.choice(['sqrt(n)', 4]),
+            "seed": training_args.seed,
+            # "large_lr": tune.sample_from(lambda _: np.random.uniform() > 0.4),
+            "learning_rate": tune.quniform(1e-4, 7e-4, 1e-4),
+            "per_device_train_batch_size": tune.choice([4, 8]), # In Monarch-Mixer they mixed 32 and 16 
+            "weight_decay": 0.1, # After 2nd HPO, all runs converged to 1e-3 #tune.choice([0.1, 0.01, 1e-3]),
+            "lr_scheduler_type": "linear", # mostly linear underperforms
+        }
+        n_trials = 16
+        
+        # Set up scheduler and reporter etc.
+        direction = "max"
+        max_t = 13 
+        grade_period = 3
+        time_attr = "training_iteration"
+        scheduler = ASHAScheduler(
+            time_attr=time_attr,
+            max_t=max_t,
+            metric = task_to_metric[data_args.task_name],
+            mode = direction,
+            grace_period=grade_period,
+        )
+        reporter = CLIReporter(
+            parameter_columns=["learning_rate", "per_device_train_batch_size", "weight_decay"],
+            metric_columns=["train_loss", "eval_loss", task_to_metric[data_args.task_name], "training_iteration"],
+            max_progress_rows=9,
+            max_report_frequency=9,
+        )   
+        
+        # Do hyperparam optimization with Ray Tune
+        best_run = trainer.hyperparameter_search(
+            hp_space=lambda _: param_space,
+            backend="ray",
+            n_trials=n_trials, # under the hood it calls ray.tune.run(num_samples=n_trials, ...)
+            scheduler=scheduler,
+            keep_checkpoints_num=0,
+            checkpoint_score_attr="min-" + task_to_metric[data_args.task_name], # rank in decreasing order
+            progress_reporter=reporter,
+            resources_per_trial={"cpu": 1, "gpu": 1},
+            local_dir="ray_results",
+            max_failures=100, # tolerate OOM
+            # callbacks=[WandbLoggerCallback(project=os.environ["WANDB_PROJECT"], group=os.environ["WANDB_RUN_GROUP"])],
+            direction="maximize" if direction == "max" else "minimize",
+            # compute_objective
+        )
+        best_hp = best_run.hyperparameters
+        json.dump(best_hp, open(os.path.join(training_args.output_dir, "best_hyperparams.json"), "w"))
+    
     # Training
     if training_args.do_train:
+        
+        # path = os.path.join(training_args.output_dir, "best_hyperparams.json")
+        # # Load best Hyperparameters from HPO
+        # best_hp = json.load(open(path, "r")) if os.path.exists(path) else None
+        # if best_hp is not None:
+        #     print("Applying best hyperparams from HPO!")
+        #     trainer.model = model_init(best_hp).to("cuda")
+        #     trainer.model_init = None
+        # else:
+        #     print("No best hyperparams found!")
+            
         checkpoint = None
         if last_checkpoint is not None:
             checkpoint = last_checkpoint

@@ -29,3 +29,4 @@ examples/text-classification/run_glue.py \
 --seed 0 \
 --weight_decay 0 \
 --use_deterministic_algorithms
+
