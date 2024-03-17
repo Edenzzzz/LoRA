@@ -232,9 +232,10 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    torch.use_deterministic_algorithms(training_args.use_deterministic_algorithms)
-    logger.info("use_deterministic_algorithms: " + str(torch.are_deterministic_algorithms_enabled()))
-
+    # torch.use_deterministic_algorithms(training_args.use_deterministic_algorithms)
+    # logger.info("use_deterministic_algorithms: " + str(torch.are_deterministic_algorithms_enabled()))
+    torch.use_deterministic_algorithms(True)
+    
     # Detecting last checkpoint.
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
@@ -349,7 +350,7 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-        cls_dropout=training_args.cls_dropout,
+        # cls_dropout=training_args.cls_dropout,
         apply_lora=model_args.apply_lora,
         lora_alpha=model_args.lora_alpha,
         lora_r=model_args.lora_r,
