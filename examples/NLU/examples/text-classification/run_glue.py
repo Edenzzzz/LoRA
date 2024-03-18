@@ -641,15 +641,15 @@ def main():
     # Training
     if training_args.do_train:
         
-        # path = os.path.join(training_args.output_dir, "best_hyperparams.json")
-        # # Load best Hyperparameters from HPO
-        # best_hp = json.load(open(path, "r")) if os.path.exists(path) else None
-        # if best_hp is not None:
-        #     print("Applying best hyperparams from HPO!")
-        #     trainer.model = model_init(best_hp).to("cuda")
-        #     trainer.model_init = None
-        # else:
-        #     print("No best hyperparams found!")
+        path = os.path.join(training_args.output_dir, "best_hyperparams.json")
+        # Load best Hyperparameters from HPO
+        best_hp = json.load(open(path, "r")) if os.path.exists(path) else None
+        if best_hp is not None:
+            print("Applying best hyperparams from HPO!")
+            trainer.model = model_init(best_hp).to("cuda")
+            trainer.model_init = None
+        else:
+            print("No best hyperparams found!")
             
         checkpoint = None
         if last_checkpoint is not None:
