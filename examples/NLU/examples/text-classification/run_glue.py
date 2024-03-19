@@ -15,7 +15,6 @@
 # limitations under the License.
 """ Finetuning the library models for sequence classification on GLUE."""
 # You can also adapt this script on your own text classification task. Pointers for this are left as comments.
-
 import logging
 import os
 import random
@@ -23,10 +22,8 @@ import sys
 import torch
 from dataclasses import dataclass, field
 from typing import Optional
-
 import numpy as np
 from datasets import load_dataset, load_metric
-
 import transformers
 from transformers import (
     AutoConfig,
@@ -44,6 +41,11 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+import ray
+from ray import tune
+from ray.tune import CLIReporter
+from ray.tune.schedulers import ASHAScheduler
+import json
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.4.0")
@@ -58,6 +60,18 @@ task_to_keys = {
     "sst2": ("sentence", None),
     "stsb": ("sentence1", "sentence2"),
     "wnli": ("sentence1", "sentence2"),
+}
+
+task_to_metric = {
+    "cola": "eval_matthews_correlation",
+    "mnli": "eval_accuracy",
+    "mrpc": "eval_accuracy",
+    "qnli": "eval_accuracy",
+    "qqp": "eval_accuracy",
+    "rte": "eval_accuracy",
+    "sst2": "eval_accuracy",
+    "stsb": "eval_pearson",
+    "wnli": "eval_accuracy",
 }
 
 logger = logging.getLogger(__name__)
@@ -145,8 +159,13 @@ class ModelArguments:
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
 
+        
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    do_tune: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to do HPO with Ray Tune or not."}
     )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
@@ -343,6 +362,7 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    model_args.lora_alpha = model_args.lora_r * 2 if model_args.lora_alpha is None else model_args.lora_alpha
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
@@ -376,6 +396,68 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
+    def model_init(hyperparams: dict = {}):
+        # For ensuring HPO acc
+        set_seed(training_args.seed)
+        # Ensure override 
+        if hyperparams is not None:
+            for key, value in hyperparams.items():
+                if key in config.__dict__:
+                    setattr(config, key, value)
+                
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+        )
+
+        trainable_params = []
+        if model_args.apply_lora:
+            if model_args.lora_path is not None:
+                lora_state_dict = torch.load(model_args.lora_path)
+                logger.info(f"Apply LoRA state dict from {model_args.lora_path}.")
+                logger.info(lora_state_dict.keys())
+                model.load_state_dict(lora_state_dict, strict=False)
+            trainable_params.append('lora')
+
+        if model_args.apply_adapter:
+            if model_args.adapter_path is not None:
+                adapter_state_dict = torch.load(os.path.join(model_args.adapter_path, 'pytorch_adapter.bin'))
+                head_state_dict = torch.load(os.path.join(model_args.adapter_path, 'pytorch_model_head.bin'))
+                added_state_dict = {}
+                for k, v in adapter_state_dict.items():
+                    new_k = k.replace(data_args.task_name + '.', '').replace('adapter_down.0.', 'adapter_A.').replace('adapter_up.', 'adapter_B.').replace('.adapters.', '.adapter.')
+                    added_state_dict[new_k] = v
+                for k, v in head_state_dict.items():
+                    new_k = k.replace('heads.' + data_args.task_name + '.1', 'classifier.dense').replace('heads.' + data_args.task_name + '.4', 'classifier.out_proj')
+                    added_state_dict[new_k] = v
+                logger.info(f"Apply adapter state dict from {model_args.adapter_path}.")
+                logger.info(added_state_dict.keys())
+                missing_keys, unexpected_keys = model.load_state_dict(added_state_dict, strict=False)
+                for missing_key in missing_keys:
+                    assert 'adapter' not in missing_key, missing_key + ' is missed in the model'
+                assert len(unexpected_keys) == 0, 'Unexpected keys ' + str(unexpected_keys)
+            trainable_params.append('adapter')
+
+        if model_args.apply_bitfit:
+            trainable_params.append('bias')
+
+        if len(trainable_params) > 0:
+            for name, param in model.named_parameters():
+                if name.startswith('deberta') or name.startswith('roberta'):
+                    param.requires_grad = False
+                    for trainable_param in trainable_params:
+                        if trainable_param in name:
+                            param.requires_grad = True
+                            break
+                else:
+                    param.requires_grad = True
+        return model
+    
+    
     trainable_params = []
     if model_args.apply_lora:
         if model_args.lora_path is not None:
@@ -479,19 +561,17 @@ def main():
         return result
 
     datasets = datasets.map(preprocess_function, batched=True, load_from_cache_file=not data_args.overwrite_cache)
-    if training_args.do_train:
-        if "train" not in datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = datasets["train"]
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+    if "train" not in datasets:
+        raise ValueError("--do_train requires a train dataset")
+    train_dataset = datasets["train"]
+    if data_args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
-    if training_args.do_eval:
-        if "validation" not in datasets and "validation_matched" not in datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
-        if data_args.max_val_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
+    if "validation" not in datasets and "validation_matched" not in datasets:
+        raise ValueError("--do_eval requires a validation dataset")
+    eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
+    if data_args.max_val_samples is not None:
+        eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
 
     if training_args.do_predict or data_args.task_name is not None or data_args.test_file is not None:
         if "test" not in datasets and "test_matched" not in datasets:
@@ -501,19 +581,19 @@ def main():
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
 
     # Log a few random samples from the training set:
-    if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    for index in random.sample(range(len(train_dataset)), 3):
+        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
-    # Get the metric function
-    if data_args.task_name is not None:
-        metric = load_metric("glue", data_args.task_name)
+
     # TODO: When datasets metrics include regular accuracy, make an else here and remove special branch from
     # compute_metrics
 
     # You can define your custom compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with a
     # predictions and label_ids field) and has to return a dictionary string to float.
     def compute_metrics(p: EvalPrediction):
+        # Get the metric function
+        if data_args.task_name is not None:
+            metric = load_metric("glue", data_args.task_name)
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
         preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
         if data_args.task_name is not None:
@@ -525,7 +605,7 @@ def main():
             return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
         else:
             return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
-
+    
     # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
     if data_args.pad_to_max_length:
         data_collator = default_data_collator
@@ -538,23 +618,91 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
 
+    # HPO with Ray Tune
+    if model_args.do_tune:
+        run_name = os.path.split(training_args.output_dir)[-1]
+        import time
+        os.environ["WANDB_PROJECT"] = "lora"
+        os.environ["WANDB_RUN_GROUP"] = run_name + "_" + time.strftime("%Y%m%d-%H%M%S")
+        os.environ["WANDB_API_KEY"] = "16d21dc747a6f33247f1e9c96895d4ffa5ea0b27"
+        del model
+        trainer.model_init = model_init
+        
+        param_space = {
+            "seed": training_args.seed,
+            "learning_rate": tune.quniform(1e-4, 7e-4, 1e-4),
+            "per_device_train_batch_size": tune.choice([4, 8]), 
+            "weight_decay": 0.1, 
+            "lr_scheduler_type": "linear", 
+        }
+        n_trials = 16
+        
+        # Set up scheduler and reporter etc.
+        direction = "max"
+        max_t = 12
+        grade_period = 4
+        time_attr = "training_iteration"
+        scheduler = ASHAScheduler(
+            time_attr=time_attr,
+            max_t=max_t,
+            metric = task_to_metric[data_args.task_name],
+            mode = direction,
+            grace_period=grade_period,
+        )
+        reporter = CLIReporter(
+            parameter_columns=["learning_rate", "per_device_train_batch_size", "weight_decay"],
+            metric_columns=["train_loss", "eval_loss", task_to_metric[data_args.task_name], "training_iteration"],
+            max_progress_rows=9,
+            max_report_frequency=9,
+        )   
+        
+        # Do hyperparam optimization with Ray Tune
+        best_run = trainer.hyperparameter_search(
+            hp_space=lambda _: param_space,
+            backend="ray",
+            n_trials=n_trials, # under the hood it calls ray.tune.run(num_samples=n_trials, ...)
+            scheduler=scheduler,
+            # keep_checkpoints_num=0,
+            # checkpoint_score_attr="min-" + task_to_metric[data_args.task_name], # rank in decreasing order
+            progress_reporter=reporter,
+            resources_per_trial={"cpu": 1, "gpu": 1},
+            local_dir="ray_results",
+            max_failures=100, # tolerate OOM
+            direction="maximize" if direction == "max" else "minimize",
+            # compute_objective
+        )
+        best_hp = best_run.hyperparameters
+        json.dump(best_hp, open(os.path.join(training_args.output_dir, "best_hyperparams.json"), "w"))
+    
     # Training
     if training_args.do_train:
+        
+        path = os.path.join(training_args.output_dir, "best_hyperparams.json")
+        # Load best Hyperparameters from HPO
+        # best_hp = json.load(open(path, "r")) if os.path.exists(path) else None
+        # if best_hp is not None:
+        #     print("Applying best hyperparams from HPO!")
+        #     for key, value in best_hp.items():
+        #         if key in trainer.args.__dict__:
+        #             setattr(config, key, value)
+        # else:
+        #     print("No best hyperparams found!")
+        
         checkpoint = None
-        if last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        elif os.path.isdir(model_args.model_name_or_path):
-            # Check the config from that potential checkpoint has the right number of labels before using it as a
-            # checkpoint.
-            if AutoConfig.from_pretrained(model_args.model_name_or_path).num_labels == num_labels:
-                checkpoint = model_args.model_name_or_path
+        # if last_checkpoint is not None:
+        #     checkpoint = last_checkpoint
+        # elif os.path.isdir(model_args.model_name_or_path):
+        #     # Check the config from that potential checkpoint has the right number of labels before using it as a
+        #     # checkpoint.
+        #     if AutoConfig.from_pretrained(model_args.model_name_or_path).num_labels == num_labels:
+        #         checkpoint = model_args.model_name_or_path
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics

@@ -1,13 +1,10 @@
-examples/NLU/cola/
-examples/NLU/cola_rank_16/
-examples/NLU/cola_rank_4/
-examples/NLU/cola_rank_8/
-examples/NLU/cola_rank_8_original/
-examples/NLU/mrpc_rank_16/
-examples/NLU/mrpc_rank_4/
-examples/NLU/ray_results/
+**/model/**
+**/log/** */
+examples/NLU/cola*
+examples/NLU/mrpc*
 examples/NLU/wandb/
 logs.txt
+**/ray_results/**
 # all files with SCRATCH prefix and large model / metric files
 **/SCRATCH*
 /pretrained_checkpoints
