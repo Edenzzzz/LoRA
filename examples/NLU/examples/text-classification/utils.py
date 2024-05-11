@@ -36,20 +36,20 @@ def param_stats(model, training=True, print_trainable=False, skip_cls=False):
         assert param_trainable != 0, "There's a bug in your code, your're training nothing!"
 
 
-# class MyAwesomeTrainer(Trainer):
-#     """
-#     Modified for initializing the monarch params and adding them to the optimizer
-#     before the 1st training step.
-#     """
+class MyAwesomeTrainer(Trainer):
+    """
+    Modified for initializing the monarch params and adding them to the optimizer
+    before the 1st training step.
+    """
     
-#     def __init__(self, *args, **kwargs):
-#         self.log_param_steps = kwargs.pop("log_param_steps", 900)
-#         self.train_step = 0
-#         super().__init__(*args, **kwargs)
+    def __init__(self, *args, **kwargs):
+        self.log_param_steps = kwargs.pop("log_param_steps", 800)
+        self.train_step = 0
+        super().__init__(*args, **kwargs)
 
-#     def training_step(self, model, inputs):
-#         if self.train_step % self.log_param_steps == 0:
-#             param_stats(model, training=False)
-#         self.train_step += 1
+    def training_step(self, model, inputs):
+        if self.train_step % self.log_param_steps == 0:
+            param_stats(model, training=False, print_trainable=False, skip_cls=True)
+        self.train_step += 1
         
-#         super().training_step(model, inputs)
+        return super().training_step(model, inputs)

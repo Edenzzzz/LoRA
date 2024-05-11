@@ -28,7 +28,7 @@ from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 import json
-# from utils import MyAwesomeTrainer
+from utils import param_stats, MyAwesomeTrainer 
 import numpy as np
 from datasets import load_dataset, load_metric
 
@@ -576,7 +576,7 @@ def main():
     # Initialize our Trainer
     training_args.load_best_model_at_end = True
     training_args.save_total_limit = 1
-    trainer = Trainer(
+    trainer = MyAwesomeTrainer(
         model_init=model_init,
         args=training_args,
         train_dataset=train_dataset,
