@@ -21,6 +21,8 @@ import os
 import random
 import sys
 import torch
+from torch import profiler
+from transformers import TrainerCallback
 from dataclasses import dataclass, field
 from typing import Optional
 import ray
@@ -79,6 +81,12 @@ task_to_metric = {
 
 logger = logging.getLogger(__name__)
 
+class ProfCallback(TrainerCallback):
+    def __init__(self, prof):
+        self.prof = prof
+    def on_step_end (self, args, state, control, **kwargs):
+        self.prof.step()
+        
 
 @dataclass
 class DataTrainingArguments:
@@ -659,8 +667,18 @@ def main():
             # checkpoint.
             if AutoConfig.from_pretrained(model_args.model_name_or_path).num_labels == num_labels:
                 checkpoint = model_args.model_name_or_path
-
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        # Profiling 
+        ctx = profiler.profile(
+            schedule=profiler.schedule(wait=1, warmup=1, active=2, repeat=1),
+            on_trace_ready=profiler.tensorboard_trace_handler("./lora_profile_log"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) 
+        
+        with ctx:
+            trainer.add_callback(ProfCallback(ctx))
+            train_result = trainer.train(resume_from_checkpoint=checkpoint)
         metrics = train_result.metrics
         max_train_samples = (
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
